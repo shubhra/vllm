@@ -362,15 +362,16 @@ class OnlineAcceptanceEstimator:
         self.intercepts = torch.full(
             (num_speculative_steps,), _INIT_BIAS, dtype=torch.float32, device=device
         )
-        # Multiplies the acceptance logit. E[σ(μ+σZ)] ≈ σ(μ / sqrt(1+πσ²/8)).
-        # var(β_k) = 1/(c_k + L2). An unobserved position has c_k = 0, so its
-        # variance is the ridge 1/L2 and its probability is pulled toward 0.5.
-        # A point estimate below 0.5 moves up, which is what lets a thin deep
-        # position win a budget it would otherwise never be checked at.
-        # Every position starts unobserved.
-        prior_scale = 1.0 / math.sqrt(1.0 + math.pi / (8.0 * self.L2))
+        # 1 keeps the point estimate. An unobserved position uses the ridge
+        # variance 1/L2, which pulls its probability toward 0.5. Once a position
+        # has any labels, the scale stays 1.
+        self._prior_logit_scale = 1.0 / math.sqrt(1.0 + math.pi / (8.0 * self.L2))
+        self._seen = [0] * num_speculative_steps
         self.logit_scale = torch.full(
-            (num_speculative_steps,), prior_scale, dtype=torch.float32, device=device
+            (num_speculative_steps,),
+            self._prior_logit_scale,
+            dtype=torch.float32,
+            device=device,
         )
         # Holds logit(max q), which is used as the feature for the logistic.
         # Stored in stable slots keyed by persistent request-state index.
@@ -504,10 +505,9 @@ class OnlineAcceptanceEstimator:
         slope = float(self.slope.detach().cpu().item())
         intercepts = [float(x) for x in self.intercepts.detach().cpu().tolist()]
         scales = []
-        for c in curvature:
-            # c = 0 is an unobserved position. var = 1/L2, not "no uncertainty".
-            var = 1.0 / (c + self.L2)
-            scales.append(1.0 / math.sqrt(1.0 + math.pi * var / 8.0))
+        for i, n in enumerate(counts):
+            self._seen[i] += n
+            scales.append(1.0 if self._seen[i] > 0 else self._prior_logit_scale)
         self.logit_scale.copy_(
             torch.tensor(scales, dtype=torch.float32, device=self.device)
         )
