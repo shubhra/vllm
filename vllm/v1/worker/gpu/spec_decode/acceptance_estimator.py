@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import torch
 
 from vllm.logger import init_logger
@@ -229,6 +231,7 @@ def _predict_kernel(
     conf_stride,
     slope_ptr,
     intercepts_ptr,
+    logit_scale_ptr,
     local_max_ptr,
     local_max_stride,
     local_sumexp_ptr,
@@ -308,7 +311,9 @@ def _predict_kernel(
     # Predict the acceptance probability from the feature and current coefficients.
     weight = tl.load(slope_ptr)
     bias = tl.load(intercepts_ptr + step)
-    prob = tl.sigmoid(weight * feature + bias)
+    # E[σ(μ+σZ)] ≈ σ(μ / sqrt(1 + πσ²/8)). Scale is 1 until a refit has curvature.
+    scale = tl.load(logit_scale_ptr + step)
+    prob = tl.sigmoid(scale * (weight * feature + bias))
     tl.store(pred_ptr + req_state_idx * pred_stride + step, prob)
     tl.store(conf_ptr + batch_idx * conf_stride + step, prob)
 
@@ -356,6 +361,13 @@ class OnlineAcceptanceEstimator:
         self.slope = torch.full((1,), _INIT_SLOPE, dtype=torch.float32, device=device)
         self.intercepts = torch.full(
             (num_speculative_steps,), _INIT_BIAS, dtype=torch.float32, device=device
+        )
+        # Multiplies the acceptance logit. 1 is the point estimate. After a refit,
+        # position k uses 1/sqrt(1 + π var(β_k)/8), with var(β_k) = 1/(c_k + L2)
+        # when that position was observed. Unobserved positions stay at 1: their
+        # c_k is only the ridge, not a measured spread.
+        self.logit_scale = torch.ones(
+            num_speculative_steps, dtype=torch.float32, device=device
         )
         # Holds logit(max q), which is used as the feature for the logistic.
         # Stored in stable slots keyed by persistent request-state index.
@@ -488,12 +500,23 @@ class OnlineAcceptanceEstimator:
             return
         slope = float(self.slope.detach().cpu().item())
         intercepts = [float(x) for x in self.intercepts.detach().cpu().tolist()]
+        scales = []
+        for c in curvature:
+            if c <= 0.0:
+                scales.append(1.0)
+            else:
+                var = 1.0 / (c + self.L2)
+                scales.append(1.0 / math.sqrt(1.0 + math.pi * var / 8.0))
+        self.logit_scale.copy_(
+            torch.tensor(scales, dtype=torch.float32, device=self.device)
+        )
         logger.info(
-            "Adaptive verification refit refit=%d n=%s c=%s slope_before=%.6g "
-            "intercepts_before=%s slope=%.6g intercepts=%s",
+            "Adaptive verification refit refit=%d n=%s c=%s scale=%s "
+            "slope_before=%.6g intercepts_before=%s slope=%.6g intercepts=%s",
             self._refits + 1,
             counts,
             curvature,
+            [round(x, 4) for x in scales],
             slope_before,
             [round(x, 6) for x in intercepts_before],
             slope,
@@ -538,6 +561,7 @@ class OnlineAcceptanceEstimator:
             confidence_probs.stride(0),
             self.slope,
             self.intercepts,
+            self.logit_scale,
             local_max,
             local_max.stride(0),
             local_sumexp,
