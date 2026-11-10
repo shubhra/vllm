@@ -362,12 +362,15 @@ class OnlineAcceptanceEstimator:
         self.intercepts = torch.full(
             (num_speculative_steps,), _INIT_BIAS, dtype=torch.float32, device=device
         )
-        # Multiplies the acceptance logit. 1 is the point estimate. After a refit,
-        # position k uses 1/sqrt(1 + π var(β_k)/8), with var(β_k) = 1/(c_k + L2)
-        # when that position was observed. Unobserved positions stay at 1: their
-        # c_k is only the ridge, not a measured spread.
-        self.logit_scale = torch.ones(
-            num_speculative_steps, dtype=torch.float32, device=device
+        # Multiplies the acceptance logit. E[σ(μ+σZ)] ≈ σ(μ / sqrt(1+πσ²/8)).
+        # var(β_k) = 1/(c_k + L2). An unobserved position has c_k = 0, so its
+        # variance is the ridge 1/L2 and its probability is pulled toward 0.5.
+        # A point estimate below 0.5 moves up, which is what lets a thin deep
+        # position win a budget it would otherwise never be checked at.
+        # Every position starts unobserved.
+        prior_scale = 1.0 / math.sqrt(1.0 + math.pi / (8.0 * self.L2))
+        self.logit_scale = torch.full(
+            (num_speculative_steps,), prior_scale, dtype=torch.float32, device=device
         )
         # Holds logit(max q), which is used as the feature for the logistic.
         # Stored in stable slots keyed by persistent request-state index.
@@ -502,11 +505,9 @@ class OnlineAcceptanceEstimator:
         intercepts = [float(x) for x in self.intercepts.detach().cpu().tolist()]
         scales = []
         for c in curvature:
-            if c <= 0.0:
-                scales.append(1.0)
-            else:
-                var = 1.0 / (c + self.L2)
-                scales.append(1.0 / math.sqrt(1.0 + math.pi * var / 8.0))
+            # c = 0 is an unobserved position. var = 1/L2, not "no uncertainty".
+            var = 1.0 / (c + self.L2)
+            scales.append(1.0 / math.sqrt(1.0 + math.pi * var / 8.0))
         self.logit_scale.copy_(
             torch.tensor(scales, dtype=torch.float32, device=self.device)
         )
