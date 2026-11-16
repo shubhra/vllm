@@ -56,7 +56,9 @@ def _expected_probs(
     rest = scaled.scatter(1, top.indices[:, None], float("-inf"))
     feature = (top.values - torch.logsumexp(rest, dim=-1)).clamp(-40.0, 40.0)
     weight, bias = estimator.slope, estimator.intercepts
-    return torch.sigmoid(weight.double() * feature + bias[steps].double()).float()
+    bonus = estimator.logit_bonus[steps].double()
+    logit = weight.double() * feature + bias[steps].double() + bonus
+    return torch.sigmoid(logit).float()
 
 
 @pytest.mark.parametrize("tokens_per_req", [1, NUM_STEPS])
@@ -328,3 +330,57 @@ def test_warmup_covers_every_batch_size_and_the_refit():
 
     assert estimator._refits == 1
     assert compiled_variants() == warmed
+
+
+def _bonus(label_count: float, l2: float = 1e-3, lam: float = 1.0, sigma0: float = 1.0) -> float:
+    sigma = (label_count + l2) ** -0.5
+    return lam * sigma / (sigma + sigma0)
+
+
+def test_bonus_shrinks_with_labels_and_survives_the_refit():
+    """Labels retire the bonus. The refit must not turn it back on.
+
+    Positions 0 and 1 are graded. Positions 2 and 3 are past the admitted
+    prefix, so they keep the cold-start bonus and stay easier to try.
+    """
+    device = current_platform.device_type
+    estimator = OnlineAcceptanceEstimator(4, NUM_STEPS, device)
+    estimator.REFIT_INTERVAL = 50
+    cold = _bonus(0.0)
+    torch.testing.assert_close(
+        estimator.logit_bonus, torch.full((NUM_STEPS,), cold, device=device)
+    )
+    assert cold < estimator.BONUS_LAMBDA
+
+    slots = torch.tensor([0], device=device, dtype=torch.int32)
+    features = torch.zeros(1, NUM_STEPS, device=device)
+    num_accepted = torch.tensor([1.0], device=device)
+    _drive_round(estimator, features, num_accepted, slots)
+
+    assert estimator._refits == 0
+    bonus = estimator.logit_bonus.tolist()
+    labels = estimator.label_counts.tolist()
+    assert labels[0] == pytest.approx(1.0)
+    assert labels[1] == pytest.approx(1.0)
+    assert labels[2] == pytest.approx(0.0)
+    assert bonus[0] == pytest.approx(_bonus(1.0))
+    assert bonus[2] == pytest.approx(cold)
+    assert bonus[0] < bonus[2]
+
+    # One hundred more labels on position 0, without touching curvature.
+    # A confident reject must still retire, which p(1-p) would not do.
+    estimator.label_counts[0] = 100.0
+    estimator._update_logit_bonus()
+    assert estimator.logit_bonus[0].item() == pytest.approx(_bonus(100.0))
+    assert estimator.logit_bonus[0].item() < 0.1
+
+    estimator._steps_since_refit = estimator.REFIT_INTERVAL - 1
+    _drive_round(estimator, features, num_accepted, slots)
+    assert estimator._refits == 1
+    assert float(estimator.counts.sum()) == 0.0
+    # The drive graded positions 0 and 1 once more. The refit cleared the
+    # window counts and left the lifetime counts in place.
+    assert estimator.label_counts[0].item() == pytest.approx(101.0)
+    assert estimator.label_counts[2].item() == pytest.approx(0.0)
+    assert estimator.logit_bonus[2].item() == pytest.approx(cold)
+    assert estimator.logit_bonus[0].item() < estimator.logit_bonus[2].item()
