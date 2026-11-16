@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
+import os
 
 import torch
 
@@ -37,6 +37,7 @@ def _accumulate_kernel(
     pred_ptr,
     pred_stride,
     counts_ptr,
+    label_counts_ptr,
     num_reqs,
     BLOCK_R: tl.constexpr,
 ):
@@ -91,6 +92,11 @@ def _accumulate_kernel(
     tl.store(grad_ptr + step * 2 + 0, tl.load(grad_ptr + step * 2 + 0) + g0_k)
     tl.store(grad_ptr + step * 2 + 1, tl.load(grad_ptr + step * 2 + 1) + g1_k)
     tl.store(counts_ptr + step, tl.load(counts_ptr + step) + count)
+    # Lifetime label count. The refit clears counts_ptr every window; this one
+    # stays, so a position's uncertainty can retire instead of resetting.
+    tl.store(
+        label_counts_ptr + step, tl.load(label_counts_ptr + step) + count
+    )
 
 
 @triton.jit
@@ -231,7 +237,7 @@ def _predict_kernel(
     conf_stride,
     slope_ptr,
     intercepts_ptr,
-    logit_scale_ptr,
+    logit_bonus_ptr,
     local_max_ptr,
     local_max_stride,
     local_sumexp_ptr,
@@ -308,12 +314,13 @@ def _predict_kernel(
     feature = tl.minimum(tl.maximum(feature, -MAX_LOG_ODDS), MAX_LOG_ODDS)
     tl.store(features_ptr + req_state_idx * features_stride + step, feature)
 
-    # Predict the acceptance probability from the feature and current coefficients.
+    # Point-estimate logit plus a bonus that shrinks as labels accumulate.
+    # The bonus is at most BONUS_LAMBDA, so μ still ranks positions. It is
+    # added, so uncertainty never pulls a probability below its point estimate.
     weight = tl.load(slope_ptr)
     bias = tl.load(intercepts_ptr + step)
-    # E[σ(μ+σZ)] ≈ σ(μ / sqrt(1 + πσ²/8)). Scale is 1 until a refit has curvature.
-    scale = tl.load(logit_scale_ptr + step)
-    prob = tl.sigmoid(scale * (weight * feature + bias))
+    bonus = tl.load(logit_bonus_ptr + step)
+    prob = tl.sigmoid(weight * feature + bias + bonus)
     tl.store(pred_ptr + req_state_idx * pred_stride + step, prob)
     tl.store(conf_ptr + batch_idx * conf_stride + step, prob)
 
@@ -342,8 +349,17 @@ class OnlineAcceptanceEstimator:
     # just slowly, instead of freezing until it crosses a threshold. Lower values
     # track a drifting workload faster, higher ones are steadier on thin data.
     DAMPING_OBSERVATIONS = 50.0
-    # Ridge on the Newton solve.
+    # Ridge on the Newton solve. Also the prior precision on a position
+    # that has no labels yet.
     L2 = 1e-3
+    # Added to the point-estimate logit: λ · σ / (σ + σ₀), with
+    # σ = 1 / sqrt(C_k + L2) and C_k the lifetime label count.
+    # σ₀ = 1 puts the bonus near λ before any labels and cuts it in half
+    # after the first one. An unbounded σ starts near 32 and saturates
+    # every sigmoid, so the point estimate would not rank anything.
+    # AV_BONUS_LAMBDA=0 is the point estimate: the added term is zero.
+    BONUS_LAMBDA = float(os.environ.get("AV_BONUS_LAMBDA", "1"))
+    BONUS_SIGMA0 = 1.0
 
     def __init__(
         self,
@@ -355,6 +371,7 @@ class OnlineAcceptanceEstimator:
         self.device = device
         self._steps_since_refit = 0
         self._refits = 0
+        self._outcome_step = 0
         self._accumulate_block_r = max(256, triton.next_power_of_2(max_num_reqs))
 
         # The learned coefficients used for predicting acceptance.
@@ -362,17 +379,15 @@ class OnlineAcceptanceEstimator:
         self.intercepts = torch.full(
             (num_speculative_steps,), _INIT_BIAS, dtype=torch.float32, device=device
         )
-        # 1 keeps the point estimate. An unobserved position uses the ridge
-        # variance 1/L2, which pulls its probability toward 0.5. Once a position
-        # has any labels, the scale stays 1.
-        self._prior_logit_scale = 1.0 / math.sqrt(1.0 + math.pi / (8.0 * self.L2))
-        self._seen = [0] * num_speculative_steps
-        self.logit_scale = torch.full(
-            (num_speculative_steps,),
-            self._prior_logit_scale,
-            dtype=torch.float32,
-            device=device,
+        # Lifetime labels per draft position. Not cleared at a refit.
+        # The per-window counts tensor is what the Newton step damps with.
+        self.label_counts = torch.zeros(
+            num_speculative_steps, dtype=torch.float32, device=device
         )
+        self.logit_bonus = torch.empty(
+            num_speculative_steps, dtype=torch.float32, device=device
+        )
+        self._update_logit_bonus()
         # Holds logit(max q), which is used as the feature for the logistic.
         # Stored in stable slots keyed by persistent request-state index.
         self.features = torch.zeros(
@@ -427,7 +442,16 @@ class OnlineAcceptanceEstimator:
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
+        budget_width: torch.Tensor | None = None,
     ) -> None:
+        # Full verification can accept past the scorer's width. Those tokens
+        # stay out of the fit, so the next width is still the point estimate.
+        if budget_width is not None:
+            num_sampled, num_rejected = self._clip_labels_to_budget(
+                num_sampled, num_rejected, budget_width
+            )
+        # Grades for the drafts verified on the previous step.
+        self._log_position_outcomes(num_sampled, num_rejected)
         # Accumulate the previous step's graded drafts into the IRLS statistics.
         num_reqs = idx_mapping.shape[0]
         _accumulate_kernel[(self.num_speculative_steps,)](
@@ -441,12 +465,16 @@ class OnlineAcceptanceEstimator:
             self.predictions,
             self.predictions.stride(0),
             self.counts,
+            self.label_counts,
             num_reqs,
             BLOCK_R=self._accumulate_block_r,
             num_warps=1 if self._accumulate_block_r <= 256 else 4,
         )
 
         self._steps_since_refit += 1
+        # The next draft reads logit_bonus inside the captured graph, so the
+        # bonus has to be refreshed before that replay, not at the refit.
+        self._update_logit_bonus()
         if self._steps_since_refit < self.REFIT_INTERVAL:
             return
         self._steps_since_refit = 0
@@ -456,12 +484,80 @@ class OnlineAcceptanceEstimator:
         self._refit()
         self._refits += 1
 
+    def _clip_labels_to_budget(
+        self,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        budget_width: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        accepted = (num_sampled.to(torch.int32) - 1).clamp(min=0)
+        width = budget_width.to(torch.int32)
+        # width < 0 is a request that did not draft. Once the accept streak
+        # reaches the budget, the reject itself was not admitted.
+        covered = (width >= 0) & (accepted >= width)
+        sampled = torch.where(covered, width + 1, num_sampled.to(torch.int32))
+        rejected = torch.where(
+            covered,
+            torch.zeros_like(num_rejected, dtype=torch.int32),
+            num_rejected.to(torch.int32),
+        )
+        return sampled, rejected
+
+    def _log_position_outcomes(
+        self, num_sampled: torch.Tensor, num_rejected: torch.Tensor
+    ) -> None:
+        """Count, per draft position, how many requests verified it and matched it.
+
+        Position k matched when it was inside the accepted prefix. It was
+        verified when it was admitted, which also includes the first reject.
+        """
+        self._outcome_step += 1
+        if (
+            torch.cuda.is_current_stream_capturing()
+            or num_sampled.numel() == 0
+        ):
+            return
+        accepted = (num_sampled.to(torch.int32) - 1).clamp(min=0)
+        admitted = accepted + num_rejected.to(torch.int32).clamp(min=0)
+        if int(admitted.max().item()) <= 0:
+            return
+        positions = torch.arange(
+            self.num_speculative_steps, device=admitted.device
+        )
+        verified = (admitted[:, None] > positions).sum(dim=0).tolist()
+        matched = (accepted[:, None] > positions).sum(dim=0).tolist()
+        logger.info(
+            "Adaptive verification position_outcomes step=%d verified=%s matched=%s",
+            self._outcome_step,
+            [int(x) for x in verified],
+            [int(x) for x in matched],
+        )
+
+    def _update_logit_bonus(self) -> None:
+        """logit bonus = λ · σ / (σ + σ₀), σ = 1 / sqrt(C_k + L2).
+
+        C_k counts labels. A confident reject has almost no p(1-p) curvature,
+        but it still adds one to C_k, so the bonus fades and the position can
+        leave the budget. The same bonus is at most λ, including at C_k = 0
+        where σ is about 32.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        sigma = torch.rsqrt(self.label_counts + self.L2)
+        self.logit_bonus.copy_(
+            self.BONUS_LAMBDA * sigma / (sigma + self.BONUS_SIGMA0)
+        )
+
     def warmup(self) -> None:
         """Drop warmup statistics and compile the refit kernel. A refit on
         zeroed statistics leaves the coefficients unchanged."""
         self.info.zero_()
         self.grad.zero_()
         self.counts.zero_()
+        # Warmup drafts are not real labels. A position that was only graded
+        # during warmup goes back to the full bonus.
+        self.label_counts.zero_()
+        self._update_logit_bonus()
         self._steps_since_refit = 0
         self._refit()
 
@@ -504,20 +600,18 @@ class OnlineAcceptanceEstimator:
             return
         slope = float(self.slope.detach().cpu().item())
         intercepts = [float(x) for x in self.intercepts.detach().cpu().tolist()]
-        scales = []
-        for i, n in enumerate(counts):
-            self._seen[i] += n
-            scales.append(1.0 if self._seen[i] > 0 else self._prior_logit_scale)
-        self.logit_scale.copy_(
-            torch.tensor(scales, dtype=torch.float32, device=self.device)
-        )
+        labels = [
+            int(round(float(x))) for x in self.label_counts.detach().cpu().tolist()
+        ]
+        bonus = [round(float(x), 4) for x in self.logit_bonus.detach().cpu().tolist()]
         logger.info(
-            "Adaptive verification refit refit=%d n=%s c=%s scale=%s "
+            "Adaptive verification refit refit=%d n=%s c=%s labels=%s bonus=%s "
             "slope_before=%.6g intercepts_before=%s slope=%.6g intercepts=%s",
             self._refits + 1,
             counts,
             curvature,
-            [round(x, 4) for x in scales],
+            labels,
+            bonus,
             slope_before,
             [round(x, 6) for x in intercepts_before],
             slope,
@@ -562,7 +656,7 @@ class OnlineAcceptanceEstimator:
             confidence_probs.stride(0),
             self.slope,
             self.intercepts,
-            self.logit_scale,
+            self.logit_bonus,
             local_max,
             local_max.stride(0),
             local_sumexp,
